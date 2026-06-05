@@ -4,6 +4,7 @@
 - Операция: касса → приход/расход → сумма → комментарий
 - Отчёты: день / неделя / месяц
 - Роли: ADMIN / STAFF
+- Отмена последней операции (только админы, с уведомлением)
 """
 
 import os
@@ -26,17 +27,17 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
 
-# Роли пользователей: Telegram ID → "admin" или "staff"
 USERS = {
     355266614: "admin",
     331620668: "admin",
     6864362402: "staff",
 }
 
+ADMIN_IDS = [uid for uid, role in USERS.items() if role == "admin"]
+
 CASH_FIRMA  = "Касса Фирмы"
 CASH_OFFICE = "Касса Офиса"
 
-# ─── Состояния диалога ────────────────────────────────────────────────────────
 ST_CASH, ST_TYPE, ST_AMOUNT, ST_COMMENT = range(4)
 
 
@@ -61,6 +62,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📊 Отчёт: Фирма", callback_data="rep_firma"),
             InlineKeyboardButton("📊 Отчёт: Офис", callback_data="rep_office"),
         ])
+        buttons.append([InlineKeyboardButton("↩️ Отменить последнюю операцию", callback_data="undo_last")])
     else:
         buttons.append([
             InlineKeyboardButton("➕ Приход", callback_data="op_income"),
@@ -142,7 +144,6 @@ async def op_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["op_type"] = op_type
 
     if role == "admin":
-        # Админ выбирает кассу
         await query.edit_message_text(
             "Выберите кассу:",
             reply_markup=InlineKeyboardMarkup([
@@ -153,7 +154,6 @@ async def op_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return ST_CASH
     else:
-        # Сотрудник — только Офис
         ctx.user_data["cash"] = CASH_OFFICE
         return await _ask_amount(query)
 
@@ -232,24 +232,104 @@ async def op_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ─── Отмена последней операции ────────────────────────────────────────────────
+
+async def undo_last_ask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+
+    if get_role(uid) != "admin":
+        await query.edit_message_text("⛔ Только для администраторов.", reply_markup=back_kb())
+        return
+
+    sc: SheetsClient = ctx.bot_data["sheets"]
+    last = sc.get_last_transaction()
+
+    if not last:
+        await query.edit_message_text("❗ Нет операций для отмены.", reply_markup=back_kb())
+        return
+
+    sign = "➕" if last["type"] == "income" else "➖"
+    cash_icon = "🏢" if last["cash"] == CASH_FIRMA else "🏠"
+
+    await query.edit_message_text(
+        f"↩️ *Отменить последнюю операцию?*\n\n"
+        f"{cash_icon} {last['cash']}\n"
+        f"{sign} `{fmt(last['amount'])}`\n"
+        f"💬 {last['comment']}\n"
+        f"👤 {last['user']} • {last['date']} {last['time']}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Да, отменить", callback_data="undo_confirm")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="menu")],
+        ])
+    )
+
+async def undo_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = query.from_user.id
+    username = update.effective_user.username or str(uid)
+
+    if get_role(uid) != "admin":
+        await query.edit_message_text("⛔ Только для администраторов.", reply_markup=back_kb())
+        return
+
+    sc: SheetsClient = ctx.bot_data["sheets"]
+    last = sc.get_last_transaction()
+
+    if not last:
+        await query.edit_message_text("❗ Нет операций для отмены.", reply_markup=back_kb())
+        return
+
+    sc.delete_last_transaction(last)
+    balance = sc.get_balance(last["cash"])
+
+    sign = "➕" if last["type"] == "income" else "➖"
+    cash_icon = "🏢" if last["cash"] == CASH_FIRMA else "🏠"
+
+    result_text = (
+        f"✅ *Операция отменена*\n\n"
+        f"{cash_icon} {last['cash']}\n"
+        f"{sign} `{fmt(last['amount'])}` — {last['comment']}\n\n"
+        f"💰 Новый остаток: `{fmt(balance)}`"
+    )
+
+    await query.edit_message_text(result_text, parse_mode="Markdown", reply_markup=back_kb())
+
+    # Уведомление всем админам
+    notify_text = (
+        f"⚠️ *Операция отменена администратором @{username}*\n\n"
+        f"{cash_icon} {last['cash']}\n"
+        f"{sign} `{fmt(last['amount'])}` — {last['comment']}\n"
+        f"📅 {last['date']} {last['time']} • внёс: {last['user']}\n\n"
+        f"💰 Остаток: `{fmt(balance)}`"
+    )
+    for admin_id in ADMIN_IDS:
+        if admin_id != uid:
+            try:
+                await ctx.bot.send_message(admin_id, notify_text, parse_mode="Markdown")
+            except Exception:
+                pass
+
+
 # ─── Отчёты ───────────────────────────────────────────────────────────────────
 
 async def show_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    sc: SheetsClient = ctx.bot_data["sheets"]
 
     cash = CASH_FIRMA if query.data == "rep_firma" else CASH_OFFICE
     cash_icon = "🏢" if cash == CASH_FIRMA else "🏠"
-    today = date.today()
 
     await query.edit_message_text(
         f"{cash_icon} *{cash}*\n\nВыберите период:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📊 Сегодня",  callback_data=f"rp_day_{cash}")],
-            [InlineKeyboardButton("📅 Неделя",   callback_data=f"rp_week_{cash}")],
-            [InlineKeyboardButton("🗓 Месяц",    callback_data=f"rp_month_{cash}")],
+            [InlineKeyboardButton("📊 Сегодня",  callback_data=f"rp_day_{'firma' if cash == CASH_FIRMA else 'office'}")],
+            [InlineKeyboardButton("📅 Неделя",   callback_data=f"rp_week_{'firma' if cash == CASH_FIRMA else 'office'}")],
+            [InlineKeyboardButton("🗓 Месяц",    callback_data=f"rp_month_{'firma' if cash == CASH_FIRMA else 'office'}")],
             [InlineKeyboardButton("◀️ Назад",    callback_data="menu")],
         ])
     )
@@ -259,10 +339,11 @@ async def show_report_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     sc: SheetsClient = ctx.bot_data["sheets"]
 
-    _, period, *cash_parts = query.data.split("_")
-    cash = "_".join(cash_parts)  # восстанавливаем название кассы
-    # Определяем cash по содержимому
-    cash = CASH_FIRMA if "ирм" in query.data else CASH_OFFICE
+    data = query.data  # rp_day_firma / rp_week_office etc
+    parts = data.split("_")
+    period = parts[1]
+    cash_key = parts[2]
+    cash = CASH_FIRMA if cash_key == "firma" else CASH_OFFICE
     cash_icon = "🏢" if cash == CASH_FIRMA else "🏠"
 
     today = date.today()
@@ -285,7 +366,6 @@ async def show_report_period(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         expense = sum(r["amount"] for r in rows if r["type"] == "expense")
         balance = sc.get_balance(cash)
 
-        # Последние 5 операций
         last = rows[-5:]
         ops_lines = "\n".join(
             f"{'➕' if r['type']=='income' else '➖'} `{fmt(r['amount'])}` — {r['comment'][:30]}"
@@ -333,7 +413,9 @@ def main():
     app.add_handler(CallbackQueryHandler(show_balance_all,    pattern="^balance_all$"))
     app.add_handler(CallbackQueryHandler(show_balance_office, pattern="^balance_office$"))
     app.add_handler(CallbackQueryHandler(show_report,         pattern="^rep_(firma|office)$"))
-    app.add_handler(CallbackQueryHandler(show_report_period,  pattern="^rp_(day|week|month)_"))
+    app.add_handler(CallbackQueryHandler(show_report_period,  pattern="^rp_(day|week|month)_(firma|office)$"))
+    app.add_handler(CallbackQueryHandler(undo_last_ask,       pattern="^undo_last$"))
+    app.add_handler(CallbackQueryHandler(undo_confirm,        pattern="^undo_confirm$"))
     app.add_handler(CallbackQueryHandler(menu_callback,       pattern="^menu$"))
 
     logger.info("Бот запущен")
