@@ -6,8 +6,8 @@ Google Sheets клиент v2
 
 from __future__ import annotations
 import os
+import json
 from datetime import date, datetime
-from typing import Literal
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
@@ -19,10 +19,17 @@ SHEET_BAL = "Балансы"
 class SheetsClient:
     def __init__(self, spreadsheet_id: str):
         self.spreadsheet_id = spreadsheet_id
-        creds = Credentials.from_service_account_file(
-            os.environ.get("GOOGLE_CREDENTIALS_FILE", "credentials.json"),
-            scopes=SCOPES,
-        )
+
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            creds_info = json.loads(creds_json)
+            creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+        else:
+            creds = Credentials.from_service_account_file(
+                os.environ.get("GOOGLE_CREDENTIALS_FILE", "credentials.json"),
+                scopes=SCOPES,
+            )
+
         self.service = build("sheets", "v4", credentials=creds)
         self.sheets = self.service.spreadsheets()
         self._ensure_sheets()
@@ -41,22 +48,18 @@ class SheetsClient:
                 body={"requests": requests}
             ).execute()
 
-        # Заголовки журналов
         for sheet in ["Касса Фирмы", "Касса Офиса"]:
             h = self._read(f"'{sheet}'!A1:F1")
             if not h or h[0] != HEADERS:
                 self._write(f"'{sheet}'!A1:F1", [HEADERS])
 
-        # Балансы
-        bal = self._read(f"'{SHEET_BAL}'!A1:C2")
-        if not bal or len(bal) < 2:
+        bal = self._read(f"'{SHEET_BAL}'!A1:C3")
+        if not bal or len(bal) < 3:
             self._write(f"'{SHEET_BAL}'!A1:C3", [
                 ["Касса", "Остаток", "Обновлено"],
                 ["Касса Фирмы", 0, ""],
                 ["Касса Офиса", 0, ""],
             ])
-
-    # ── Операции ─────────────────────────────────────────────────────────────
 
     def add_transaction(self, cash: str, op_type: str, amount: float, comment: str, user: str):
         now = datetime.now()
@@ -81,7 +84,7 @@ class SheetsClient:
 
     def get_balance(self, cash: str) -> float:
         data = self._read(f"'{SHEET_BAL}'!A:B")
-        for row in data[1:]:  # пропускаем заголовок
+        for row in data[1:]:
             if len(row) >= 2 and row[0] == cash:
                 try:
                     return float(str(row[1]).replace(",", "."))
@@ -98,7 +101,7 @@ class SheetsClient:
                 self._write(f"'{SHEET_BAL}'!B{row_num}:C{row_num}", [[balance, now]])
                 return
 
-    def get_transactions(self, cash: str, date_from: date, date_to: date) -> list[dict]:
+    def get_transactions(self, cash: str, date_from: date, date_to: date) -> list:
         data = self._read(f"'{cash}'!A2:F")
         if not data:
             return []
@@ -122,16 +125,14 @@ class SheetsClient:
             })
         return result
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _read(self, range_: str) -> list[list]:
+    def _read(self, range_: str) -> list:
         res = self.sheets.values().get(
             spreadsheetId=self.spreadsheet_id,
             range=range_,
         ).execute()
         return res.get("values", [])
 
-    def _write(self, range_: str, values: list[list]):
+    def _write(self, range_: str, values: list):
         self.sheets.values().update(
             spreadsheetId=self.spreadsheet_id,
             range=range_,
