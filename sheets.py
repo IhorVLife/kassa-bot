@@ -139,3 +139,71 @@ class SheetsClient:
             valueInputOption="USER_ENTERED",
             body={"values": values},
         ).execute()
+
+    def get_last_transaction(self):
+        """Возвращает последнюю операцию из любой кассы."""
+        last = None
+        last_row_info = None
+
+        for cash in ["Касса Фирмы", "Касса Офиса"]:
+            data = self._read(f"'{cash}'!A2:F")
+            if not data:
+                continue
+            for i, row in enumerate(data):
+                if len(row) < 4:
+                    continue
+                try:
+                    tx_date = datetime.strptime(row[0], "%d.%m.%Y").date()
+                    tx_time = row[1] if len(row) > 1 else "00:00"
+                    tx_dt = datetime.strptime(f"{row[0]} {tx_time}", "%d.%m.%Y %H:%M")
+                except ValueError:
+                    continue
+                if last is None or tx_dt > last:
+                    last = tx_dt
+                    last_row_info = {
+                        "cash": cash,
+                        "row_index": i + 2,  # +2 потому что начинаем с A2
+                        "date": row[0],
+                        "time": tx_time,
+                        "type": "income" if row[2] == "Приход" else "expense",
+                        "amount": float(str(row[3]).replace(",", ".")),
+                        "comment": row[4] if len(row) > 4 else "",
+                        "user": row[5] if len(row) > 5 else "",
+                    }
+        return last_row_info
+
+    def delete_last_transaction(self, tx: dict):
+        """Удаляет строку и корректирует баланс."""
+        cash = tx["cash"]
+        row_index = tx["row_index"]
+
+        # Получаем sheet ID
+        meta = self.sheets.get(spreadsheetId=self.spreadsheet_id).execute()
+        sheet_id = None
+        for s in meta["sheets"]:
+            if s["properties"]["title"] == cash:
+                sheet_id = s["properties"]["sheetId"]
+                break
+
+        if sheet_id is None:
+            return
+
+        # Удаляем строку
+        self.sheets.batchUpdate(
+            spreadsheetId=self.spreadsheet_id,
+            body={"requests": [{
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_index - 1,
+                        "endIndex": row_index,
+                    }
+                }
+            }]}
+        ).execute()
+
+        # Корректируем баланс
+        delta = tx["amount"] if tx["type"] == "income" else -tx["amount"]
+        new_balance = round(self.get_balance(cash) - delta, 2)
+        self._update_balance(cash, new_balance)
